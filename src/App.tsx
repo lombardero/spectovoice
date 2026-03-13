@@ -83,14 +83,23 @@ function freqPct(hz: number) {
   return 1 - Math.pow(norm, FREQ_SCALE_EXP)                       // 0=top, 1=bottom
 }
 
+// Note frequencies in standard tuning (A4 = 440 Hz): f = 440 × 2^((midi−69)/12)
 const FREQ_LABELS: { label: string; pct: number; edge: 'top' | 'mid' | 'bot' }[] = [
-  { label: '2 kHz',  pct: freqPct(2000), edge: 'top' },
-  { label: '1 kHz',  pct: freqPct(1000), edge: 'mid' },
-  { label: '500 Hz', pct: freqPct(500),  edge: 'mid' },
-  { label: '200 Hz', pct: freqPct(200),  edge: 'mid' },
-  { label: '100 Hz', pct: freqPct(100),  edge: 'mid' },
-  { label: '50 Hz',  pct: freqPct(50),   edge: 'mid' },
-  { label: '20 Hz',  pct: freqPct(20),   edge: 'bot' },
+  { label: 'E7', pct: freqPct(2637.02), edge: 'top' },
+  { label: 'C7', pct: freqPct(2093.00), edge: 'mid' },
+  { label: 'A6', pct: freqPct(1760.00), edge: 'mid' },
+  { label: 'G6', pct: freqPct(1567.98), edge: 'mid' },
+  { label: 'E6', pct: freqPct(1318.51), edge: 'mid' },
+  { label: 'C6', pct: freqPct(1046.50), edge: 'mid' },
+  { label: 'G5', pct: freqPct(783.99),  edge: 'mid' },
+  { label: 'C5', pct: freqPct(523.25),  edge: 'mid' },
+  { label: 'G4', pct: freqPct(392.00),  edge: 'mid' },
+  { label: 'C4', pct: freqPct(261.63),  edge: 'mid' },
+  { label: 'G3', pct: freqPct(196.00),  edge: 'mid' },
+  { label: 'C3', pct: freqPct(130.81),  edge: 'mid' },
+  { label: 'G2', pct: freqPct(98.00),   edge: 'mid' },
+  { label: 'C2', pct: freqPct(65.41),   edge: 'mid' },
+  { label: 'C1', pct: freqPct(32.70),   edge: 'bot' },
 ]
 
 const edgeTransform = {
