@@ -473,6 +473,7 @@ export default function App() {
   useEffect(() => {
     const onMouseMove = (e: MouseEvent) => moveDrag(e.clientX)
     const onTouchMove = (e: TouchEvent) => {
+      if (!isDraggingRef.current) return
       if (e.touches.length === 1) { moveDrag(e.touches[0].clientX); e.preventDefault() }
     }
     window.addEventListener('mousemove', onMouseMove)
@@ -545,34 +546,36 @@ export default function App() {
           {pending ? <SpinnerIcon /> : isRunning ? <PauseIcon /> : <PlayIcon />}
         </button>
 
-        <div style={styles.sliderGroup}>
-          <label style={styles.sliderLabel} htmlFor="brightness">Brightness</label>
-          <input
-            id="brightness"
-            type="range"
-            min={0.3}
-            max={4}
-            step={0.05}
-            value={brightness}
-            onChange={e => setBrightness(Number(e.target.value))}
-            style={styles.slider}
-          />
-          <span style={styles.sliderValue}>{brightness.toFixed(1)}×</span>
-        </div>
+        <div className="slider-row">
+          <div style={styles.sliderGroup}>
+            <label style={styles.sliderLabel} htmlFor="brightness">Brightness</label>
+            <input
+              id="brightness"
+              type="range"
+              min={0.3}
+              max={4}
+              step={0.05}
+              value={brightness}
+              onChange={e => setBrightness(Number(e.target.value))}
+              style={styles.slider}
+            />
+            <span style={styles.sliderValue}>{brightness.toFixed(1)}×</span>
+          </div>
 
-        <div style={styles.sliderGroup}>
-          <label style={styles.sliderLabel} htmlFor="mindb">Noise floor</label>
-          <input
-            id="mindb"
-            type="range"
-            min={-130}
-            max={-40}
-            step={1}
-            value={minDb}
-            onChange={e => setMinDb(Number(e.target.value))}
-            style={styles.slider}
-          />
-          <span style={styles.sliderValue}>{minDb} dB</span>
+          <div style={styles.sliderGroup}>
+            <label style={styles.sliderLabel} htmlFor="mindb">Noise floor</label>
+            <input
+              id="mindb"
+              type="range"
+              min={-130}
+              max={-40}
+              step={1}
+              value={minDb}
+              onChange={e => setMinDb(Number(e.target.value))}
+              style={styles.slider}
+            />
+            <span style={styles.sliderValue}>{minDb} dB</span>
+          </div>
         </div>
 
         <div style={styles.hint}>Drag right to pan back up to 30 s</div>

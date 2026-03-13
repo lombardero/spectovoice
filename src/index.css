@@ -15,3 +15,17 @@ body {
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
   overflow: hidden;
 }
+
+.slider-row {
+  display: flex;
+  gap: 16px;
+}
+
+@media (max-width: 600px) {
+  .slider-row {
+    align-items: stretch;
+  }
+  .slider-row > div {
+    justify-content: space-between;
+  }
+}
