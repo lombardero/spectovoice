@@ -1,4 +1,11 @@
 import { useRef, useState, useEffect, useCallback } from 'react'
+import {
+  FFT_SIZE, SCROLL_SPEED, SMOOTHING,
+  MIN_DB, MAX_DB,
+  MIN_FREQ_HZ, MAX_FREQ_HZ, FREQ_SCALE_EXP,
+  BUFFER_SECS, DEFAULT_BRIGHTNESS,
+  GAMMA, ONSET_BOOST, ONSET_SENSITIVITY, ONSET_GATE,
+} from './config'
 
 // ---------------------------------------------------------------------------
 // Blue colormap: black → deep-blue → electric-blue → cyan → near-white
@@ -30,31 +37,62 @@ function blueColor(t: number): [number, number, number] {
   return [0, 0, 0]
 }
 
-const COLOR_LUT: [number, number, number][] = Array.from({ length: 256 }, (_, i) =>
-  blueColor(i / 255)
-)
+// Pre-computed 256-entry color table (no brightness baked in)
+const COLOR_LUT: Uint8Array = (() => {
+  const buf = new Uint8Array(256 * 3)
+  for (let i = 0; i < 256; i++) {
+    const [r, g, b] = blueColor(i / 255)
+    buf[i * 3]     = r
+    buf[i * 3 + 1] = g
+    buf[i * 3 + 2] = b
+  }
+  return buf
+})()
 
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
-const FFT_SIZE     = 2048
-const SCROLL_SPEED = 3           // logical px / frame
-const SMOOTHING    = 0.6
-const MAX_FREQ_HZ  = 10_000
-const BUFFER_SECS  = 30
-const TARGET_FPS   = 60
+const TARGET_FPS = 60
 
 // ---------------------------------------------------------------------------
-// Frequency labels (linear 0–10 kHz)
+// Log-scale frequency → canvas-row mapping (fractional bin positions).
+// Storing a Float32Array lets the draw loop interpolate between adjacent FFT
+// bins instead of snapping to the nearest one — this eliminates the wide
+// uniform stripes that appear at low frequencies on a log scale.
 // ---------------------------------------------------------------------------
+function buildYToFracBin(physH: number, fftSize: number, sampleRate: number): Float32Array {
+  const arr    = new Float32Array(physH)
+  const maxBin = fftSize / 2 - 1
+  const exp    = 1 / FREQ_SCALE_EXP
+  for (let y = 0; y < physH; y++) {
+    const t    = y / (physH - 1)                          // 0 = top, 1 = bottom
+    // Power scale: pct ∈ [0,1] from top; freq = MIN + (MAX-MIN) × (1-t)^exp
+    const freq = MIN_FREQ_HZ + (MAX_FREQ_HZ - MIN_FREQ_HZ) * Math.pow(1 - t, exp)
+    arr[y] = Math.max(0, Math.min(maxBin, freq * fftSize / sampleRate))
+  }
+  return arr
+}
+
+// ---------------------------------------------------------------------------
+// Frequency labels for the log scale
+// pct = log(MAX/hz) / log(MAX/MIN)   →   0 = top, 1 = bottom
+// ---------------------------------------------------------------------------
+// pct from top: invert the power scale mapping
+function freqPct(hz: number) {
+  const norm = (hz - MIN_FREQ_HZ) / (MAX_FREQ_HZ - MIN_FREQ_HZ)  // 0=MIN, 1=MAX
+  return 1 - Math.pow(norm, FREQ_SCALE_EXP)                       // 0=top, 1=bottom
+}
+
 const FREQ_LABELS: { label: string; pct: number; edge: 'top' | 'mid' | 'bot' }[] = [
-  { label: '10 kHz', pct: 0,   edge: 'top' },
-  { label: '8 kHz',  pct: 0.2, edge: 'mid' },
-  { label: '6 kHz',  pct: 0.4, edge: 'mid' },
-  { label: '4 kHz',  pct: 0.6, edge: 'mid' },
-  { label: '2 kHz',  pct: 0.8, edge: 'mid' },
-  { label: '0 Hz',   pct: 1.0, edge: 'bot' },
+  { label: '2 kHz',  pct: freqPct(2000), edge: 'top' },
+  { label: '1 kHz',  pct: freqPct(1000), edge: 'mid' },
+  { label: '500 Hz', pct: freqPct(500),  edge: 'mid' },
+  { label: '200 Hz', pct: freqPct(200),  edge: 'mid' },
+  { label: '100 Hz', pct: freqPct(100),  edge: 'mid' },
+  { label: '50 Hz',  pct: freqPct(50),   edge: 'mid' },
+  { label: '20 Hz',  pct: freqPct(20),   edge: 'bot' },
 ]
+
 const edgeTransform = {
   top: 'translateY(2px)',
   mid: 'translateY(-50%)',
@@ -68,16 +106,18 @@ export default function App() {
   const canvasRef    = useRef<HTMLCanvasElement>(null)
   const offscreenRef = useRef<HTMLCanvasElement | null>(null)
 
-  // Physical-pixel scroll speed and buffer width (computed on resize)
   const scrollPxRef  = useRef(SCROLL_SPEED)
   const bufWidthRef  = useRef(BUFFER_SECS * TARGET_FPS * SCROLL_SPEED)
+  const yToFracBinRef = useRef<Float32Array | null>(null)  // log-scale fractional bin map
 
-  const audioCtxRef  = useRef<AudioContext | null>(null)
-  const analyserRef  = useRef<AnalyserNode | null>(null)
-  const streamRef    = useRef<MediaStream | null>(null)
-  const animFrameRef = useRef<number>(0)
-  const dataArrayRef = useRef<Uint8Array | null>(null)
-  const maxBinRef    = useRef(512)
+  const audioCtxRef       = useRef<AudioContext | null>(null)
+  const analyserRef       = useRef<AnalyserNode | null>(null)
+  const onsetAnalyserRef  = useRef<AnalyserNode | null>(null)   // tiny analyser for fast onset RMS
+  const onsetTimeDomainRef = useRef<Float32Array | null>(null)
+  const streamRef         = useRef<MediaStream | null>(null)
+  const animFrameRef      = useRef<number>(0)
+  const dataArrayRef      = useRef<Float32Array | null>(null)
+  const waveCanvasRef     = useRef<HTMLCanvasElement>(null)
 
   const writeXRef   = useRef(0)
   const totalPxRef  = useRef(0)
@@ -91,15 +131,16 @@ export default function App() {
   const [isRunning,  setIsRunning]  = useState(false)
   const [pending,    setPending]    = useState(false)
   const [isPanned,   setIsPanned]   = useState(false)
-  const [brightness, setBrightness] = useState(1.4)
+  const [brightness, setBrightness] = useState(DEFAULT_BRIGHTNESS)
+  const [minDb,      setMinDb]      = useState(MIN_DB)
   const [error,      setError]      = useState<string | null>(null)
 
   const brightnessRef = useRef(brightness)
   brightnessRef.current = brightness
+  const minDbRef = useRef(minDb)
+  minDbRef.current = minDb
 
-  // ── resize ─────────────────────────────────────────────────────────────────
-  // Everything lives in PHYSICAL pixels — the off-screen buffer matches the
-  // canvas's physical resolution so drawImage is 1-to-1, no upscaling blur.
+  // ── resize: physical-pixel canvas + off-screen buffer ────────────────────
   useEffect(() => {
     const canvas = canvasRef.current
     if (!canvas) return
@@ -108,11 +149,11 @@ export default function App() {
       const dpr   = window.devicePixelRatio || 1
       const physW = Math.round(canvas.offsetWidth  * dpr)
       const physH = Math.round(canvas.offsetHeight * dpr)
+      if (physW === 0 || physH === 0) return
 
       canvas.width  = physW
       canvas.height = physH
 
-      // Physical scroll speed and buffer width for this DPR
       const scrollPx = Math.round(SCROLL_SPEED * dpr)
       const bufW     = BUFFER_SECS * TARGET_FPS * scrollPx
       scrollPxRef.current = scrollPx
@@ -130,9 +171,24 @@ export default function App() {
       totalPxRef.current = 0
       panOffsetRef.current = 0
 
+      // Rebuild the log-scale y→bin table for this physical height.
+      // We need sampleRate; use 44100 as default until audio starts.
+      const sr = audioCtxRef.current?.sampleRate ?? 44100
+      yToFracBinRef.current = buildYToFracBin(physH, FFT_SIZE, sr)
+
       const ctx = canvas.getContext('2d')!
       ctx.fillStyle = '#000'
       ctx.fillRect(0, 0, physW, physH)
+
+      // Size the waveform strip canvas
+      const wc = waveCanvasRef.current
+      if (wc) {
+        wc.width  = physW
+        wc.height = Math.round(wc.offsetHeight * dpr)
+        const wCtx = wc.getContext('2d')!
+        wCtx.fillStyle = '#00000f'
+        wCtx.fillRect(0, 0, wc.width, wc.height)
+      }
     }
 
     resize()
@@ -141,20 +197,19 @@ export default function App() {
     return () => ro.disconnect()
   }, [])
 
-  // ── renderViewport ─────────────────────────────────────────────────────────
-  // All coordinates are physical pixels — 1:1 with the canvas, no scaling.
+  // ── renderViewport ────────────────────────────────────────────────────────
   const renderViewport = useCallback(() => {
     const canvas    = canvasRef.current
     const offscreen = offscreenRef.current
     if (!canvas || !offscreen) return
 
     const ctx  = canvas.getContext('2d')!
-    const W    = canvas.width          // physical
-    const H    = canvas.height         // physical
+    const W    = canvas.width
+    const H    = canvas.height
     const BUFW = bufWidthRef.current
 
     const srcEnd   = ((writeXRef.current - panOffsetRef.current) % BUFW + BUFW) % BUFW
-    const srcStart = ((srcEnd - W)                                % BUFW + BUFW) % BUFW
+    const srcStart = ((srcEnd - W) % BUFW + BUFW) % BUFW
 
     ctx.imageSmoothingEnabled = false
     ctx.filter = `brightness(${brightnessRef.current})`
@@ -166,41 +221,108 @@ export default function App() {
       const rightW = srcEnd
       ctx.drawImage(offscreen, srcStart, 0, leftW,  H, 0,     0, leftW,  H)
       if (rightW > 0) {
-        ctx.drawImage(offscreen, 0, 0,        rightW, H, leftW, 0, rightW, H)
+        ctx.drawImage(offscreen, 0, 0, rightW, H, leftW, 0, rightW, H)
       }
     }
 
     ctx.filter = 'none'
   }, [])
 
-  // ── draw loop ──────────────────────────────────────────────────────────────
+  // ── draw loop ─────────────────────────────────────────────────────────────
+  // Uses ImageData for pixel-perfect rendering: one pixel row = one canvas row,
+  // mapped through the log-scale yToBin table → no anti-aliasing, no blur.
   const drawLoop = useCallback(() => {
-    const offscreen = offscreenRef.current
-    const analyser  = analyserRef.current
-    const dataArray = dataArrayRef.current
-    if (!offscreen || !analyser || !dataArray) return
+    const offscreen    = offscreenRef.current
+    const analyser     = analyserRef.current
+    const dataArray    = dataArrayRef.current
+    const yToFracBin   = yToFracBinRef.current
+    const onsetAnalyser   = onsetAnalyserRef.current
+    const onsetTimeDomain = onsetTimeDomainRef.current
+    if (!offscreen || !analyser || !dataArray || !yToFracBin) return
 
     const offCtx   = offscreen.getContext('2d')!
-    offCtx.imageSmoothingEnabled = false
-    const H        = offscreen.height        // physical
-    const maxBin   = maxBinRef.current
+    const H        = offscreen.height
     const x        = writeXRef.current
     const scrollPx = scrollPxRef.current
     const BUFW     = bufWidthRef.current
 
-    analyser.getByteFrequencyData(dataArray)
+    analyser.getFloatFrequencyData(dataArray)  // float dB values — no 8-bit quantisation
 
-    offCtx.fillStyle = '#000'
-    offCtx.fillRect(x, 0, scrollPx, H)
-
-    const binH = H / maxBin
-    for (let i = 0; i < maxBin; i++) {
-      const rawValue = dataArray[maxBin - 1 - i]
-      const [r, g, b] = COLOR_LUT[rawValue]
-      if (r === 0 && g === 0 && b === 0) continue
-      offCtx.fillStyle = `rgb(${r},${g},${b})`
-      offCtx.fillRect(x, Math.floor(i * binH), scrollPx, Math.ceil(binH))
+    // ── onset detection: instantaneous RMS from the 256-sample onset analyser ──
+    // This is independent of FFT_SIZE so onsets are always detected in ≈6 ms.
+    // onsetMult = 1 + clamp(rms × ONSET_SENSITIVITY, 0, 1) × ONSET_BOOST
+    let onsetMult = 1
+    if (onsetAnalyser && onsetTimeDomain) {
+      onsetAnalyser.getFloatTimeDomainData(onsetTimeDomain)
+      let sumSqOnset = 0
+      for (let i = 0; i < onsetTimeDomain.length; i++) sumSqOnset += onsetTimeDomain[i] ** 2
+      const rms = Math.sqrt(sumSqOnset / onsetTimeDomain.length)
+      onsetMult = 1 + Math.min(1, rms * ONSET_SENSITIVITY) * ONSET_BOOST
     }
+
+    // ── waveform level strip (derived from the same dataArray as the spectrogram) ──
+    let sumSq = 0
+    for (let i = 0; i < dataArray.length; i++) {
+      const norm = Math.max(0, (dataArray[i] - minDbRef.current) / (MAX_DB - minDbRef.current))
+      sumSq += norm * norm
+    }
+    const level = Math.min(1, Math.sqrt(sumSq / dataArray.length) * 4)
+
+    const wc = waveCanvasRef.current
+    if (wc) {
+      const dpr = window.devicePixelRatio || 1
+      const wCtx = wc.getContext('2d')!
+      const wW = wc.width
+      const wH = wc.height
+      const sp  = Math.round(scrollPx)
+      // Scroll left
+      wCtx.drawImage(wc, -sp, 0)
+      // Clear new right strip
+      wCtx.fillStyle = '#00000f'
+      wCtx.fillRect(wW - sp, 0, sp, wH)
+      // Draw symmetric amplitude bar around centre line
+      const barH = Math.max(Math.round(level * (wH - 2 * dpr)), 1)
+      const cy   = wH / 2
+      const grad = wCtx.createLinearGradient(0, cy - barH / 2, 0, cy + barH / 2)
+      grad.addColorStop(0,   'rgba(0,120,255,0.5)')
+      grad.addColorStop(0.5, 'rgba(0,180,255,1)')
+      grad.addColorStop(1,   'rgba(0,120,255,0.5)')
+      wCtx.fillStyle = grad
+      wCtx.fillRect(wW - sp, Math.round(cy - barH / 2), sp, barH)
+    }
+
+    // Write a scrollPx-wide strip using ImageData (pixel-perfect, no smoothing)
+    const imgData = offCtx.createImageData(scrollPx, H)
+    const pixels  = imgData.data   // RGBA
+
+    for (let y = 0; y < H; y++) {
+      // Fractional bin position → interpolate between bin0 and bin1
+      const frac  = yToFracBin[y]
+      const bin0  = frac | 0
+      const bin1  = Math.min(bin0 + 1, dataArray.length - 1)
+      const t     = frac - bin0
+      // Interpolate in dB space then map to 0–255 colour index
+      const db         = dataArray[bin0] * (1 - t) + dataArray[bin1] * t
+      const dbRange    = MAX_DB - minDbRef.current
+      const linearNorm = Math.max(0, Math.min(1, (db - minDbRef.current) / dbRange))
+      // GAMMA > 1 darkens mid-level content so only the sharpest peaks survive → thin lines
+      const norm0 = Math.pow(linearNorm, GAMMA)
+      // Gated onset boost: only bins already above ONSET_GATE get amplified.
+      // Noise-floor bins stay dark so the gaps between harmonic lines never bloom.
+      const norm  = norm0 > ONSET_GATE ? Math.min(1, norm0 * onsetMult) : norm0
+      const ri    = Math.round(norm * 255) * 3
+
+      const rowBase = y * scrollPx * 4
+      for (let px = 0; px < scrollPx; px++) {
+        const i = rowBase + px * 4
+        pixels[i]     = COLOR_LUT[ri]
+        pixels[i + 1] = COLOR_LUT[ri + 1]
+        pixels[i + 2] = COLOR_LUT[ri + 2]
+        pixels[i + 3] = 255                            // always opaque — fixes panning trace
+      }
+    }
+
+    offCtx.putImageData(imgData, x, 0)
 
     writeXRef.current  = (x + scrollPx) % BUFW
     totalPxRef.current = Math.min(totalPxRef.current + scrollPx, BUFW)
@@ -209,10 +331,10 @@ export default function App() {
     animFrameRef.current = requestAnimationFrame(drawLoop)
   }, [renderViewport])
 
-  // Re-render when brightness changes (including while paused)
+  // Re-render when brightness changes (even while paused)
   useEffect(() => { renderViewport() }, [brightness, renderViewport])
 
-  // ── audio ──────────────────────────────────────────────────────────────────
+  // ── audio ─────────────────────────────────────────────────────────────────
   const snapToLive = useCallback(() => {
     panOffsetRef.current = 0
     isPannedRef.current  = false
@@ -234,18 +356,28 @@ export default function App() {
       audioCtxRef.current = audioCtx
 
       const analyser = audioCtx.createAnalyser()
-      analyser.fftSize = FFT_SIZE
+      analyser.fftSize              = FFT_SIZE
       analyser.smoothingTimeConstant = SMOOTHING
-      analyser.minDecibels = -90
-      analyser.maxDecibels = -10
+      analyser.minDecibels          = -90
+      analyser.maxDecibels          = -10
       analyserRef.current = analyser
 
-      maxBinRef.current = Math.min(
-        analyser.frequencyBinCount,
-        Math.floor(MAX_FREQ_HZ * FFT_SIZE / audioCtx.sampleRate)
-      )
-      dataArrayRef.current = new Uint8Array(analyser.frequencyBinCount)
-      audioCtx.createMediaStreamSource(stream).connect(analyser)
+      dataArrayRef.current = new Float32Array(analyser.frequencyBinCount)
+
+      // Second tiny analyser: 256-sample window (≈6 ms) for fast onset detection.
+      // Connected to the same source — does NOT affect the main spectrogram.
+      const onsetAnalyser = audioCtx.createAnalyser()
+      onsetAnalyser.fftSize = 256
+      onsetAnalyserRef.current  = onsetAnalyser
+      onsetTimeDomainRef.current = new Float32Array(256)
+
+      // Rebuild yToFracBin with the real sample rate
+      const physH = canvasRef.current?.height ?? 800
+      yToFracBinRef.current = buildYToFracBin(physH, FFT_SIZE, audioCtx.sampleRate)
+
+      const source = audioCtx.createMediaStreamSource(stream)
+      source.connect(analyser)
+      source.connect(onsetAnalyser)
 
       snapToLive()
       setIsRunning(true)
@@ -268,6 +400,12 @@ export default function App() {
   const pauseRecording = useCallback(() => {
     cancelAnimationFrame(animFrameRef.current)
     setIsRunning(false)
+    const wc = waveCanvasRef.current
+    if (wc) {
+      const ctx = wc.getContext('2d')!
+      ctx.fillStyle = '#00000f'
+      ctx.fillRect(0, 0, wc.width, wc.height)
+    }
   }, [])
 
   const resumeRecording = useCallback(() => {
@@ -283,7 +421,7 @@ export default function App() {
     else startRecording()
   }, [isRunning, pauseRecording, resumeRecording, startRecording])
 
-  // ── panning (window-level so drag outside canvas still works) ─────────────
+  // ── panning (window-level so dragging outside canvas still works) ─────────
   const handleMouseDown = useCallback((e: React.MouseEvent) => {
     isDraggingRef.current   = true
     dragStartXRef.current   = e.clientX
@@ -309,12 +447,10 @@ export default function App() {
       }
       renderViewport()
     }
-
     const onUp = () => {
       isDraggingRef.current      = false
       document.body.style.cursor = ''
     }
-
     window.addEventListener('mousemove', onMove)
     window.addEventListener('mouseup',   onUp)
     return () => {
@@ -323,7 +459,7 @@ export default function App() {
     }
   }, [renderViewport])
 
-  // ── cleanup ────────────────────────────────────────────────────────────────
+  // ── cleanup ───────────────────────────────────────────────────────────────
   useEffect(() => {
     return () => {
       cancelAnimationFrame(animFrameRef.current)
@@ -332,12 +468,15 @@ export default function App() {
     }
   }, [])
 
-  // ── render ─────────────────────────────────────────────────────────────────
+  // ── render ────────────────────────────────────────────────────────────────
   return (
     <div style={styles.root}>
       <h1 style={styles.title}>SpectoVoice</h1>
 
       <div style={styles.canvasWrapper}>
+        {/* Waveform level strip */}
+        <canvas ref={waveCanvasRef} style={styles.waveStrip} />
+
         <canvas
           ref={canvasRef}
           style={styles.canvas}
@@ -392,7 +531,22 @@ export default function App() {
           <span style={styles.sliderValue}>{brightness.toFixed(1)}×</span>
         </div>
 
-        <div style={styles.hint}>Drag left to pan back up to 30 s</div>
+        <div style={styles.sliderGroup}>
+          <label style={styles.sliderLabel} htmlFor="mindb">Noise floor</label>
+          <input
+            id="mindb"
+            type="range"
+            min={-130}
+            max={-40}
+            step={1}
+            value={minDb}
+            onChange={e => setMinDb(Number(e.target.value))}
+            style={styles.slider}
+          />
+          <span style={styles.sliderValue}>{minDb} dB</span>
+        </div>
+
+        <div style={styles.hint}>Drag right to pan back up to 30 s</div>
       </div>
     </div>
   )
@@ -457,6 +611,15 @@ const styles: Record<string, React.CSSProperties> = {
     textTransform: 'uppercase',
     flexShrink: 0,
   },
+  waveStrip: {
+    position: 'absolute',
+    top: 0,
+    left: 0,
+    width: '100%',
+    height: '52px',
+    display: 'block',
+    borderBottom: '1px solid rgba(0,80,180,0.25)',
+  },
   canvasWrapper: {
     position: 'relative',
     width: '100%',
@@ -491,7 +654,7 @@ const styles: Record<string, React.CSSProperties> = {
     position: 'absolute',
     top: 0,
     left: 0,
-    width: '60px',
+    width: '62px',
     height: '100%',
     pointerEvents: 'none',
   },
