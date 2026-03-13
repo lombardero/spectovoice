@@ -41,7 +41,7 @@ export const MAX_DB = -30
 // ── Frequency range displayed ────────────────────────────────────────────────
 
 export const MIN_FREQ_HZ = 20
-export const MAX_FREQ_HZ = 2_000
+export const MAX_FREQ_HZ = 5_000
 
 // Frequency axis scale exponent (power scale).
 //   1.0 = linear — equal Hz per pixel, high frequencies dominate the screen

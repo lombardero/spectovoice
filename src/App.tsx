@@ -127,6 +127,7 @@ export default function App() {
   const dragStartXRef   = useRef(0)
   const dragStartPanRef = useRef(0)
   const isPannedRef     = useRef(false)
+  const lastFrameTimeRef = useRef(0)
 
   const [isRunning,  setIsRunning]  = useState(false)
   const [pending,    setPending]    = useState(false)
@@ -231,7 +232,16 @@ export default function App() {
   // ── draw loop ─────────────────────────────────────────────────────────────
   // Uses ImageData for pixel-perfect rendering: one pixel row = one canvas row,
   // mapped through the log-scale yToBin table → no anti-aliasing, no blur.
-  const drawLoop = useCallback(() => {
+  const drawLoop = useCallback((timestamp: number) => {
+    // Throttle to TARGET_FPS regardless of display refresh rate (e.g. 120 Hz on newer Macs).
+    const interval = 1000 / TARGET_FPS
+    const elapsed  = timestamp - lastFrameTimeRef.current
+    if (elapsed < interval) {
+      animFrameRef.current = requestAnimationFrame(drawLoop)
+      return
+    }
+    lastFrameTimeRef.current = timestamp - (elapsed % interval)
+
     const offscreen    = offscreenRef.current
     const analyser     = analyserRef.current
     const dataArray    = dataArrayRef.current
@@ -381,6 +391,7 @@ export default function App() {
 
       snapToLive()
       setIsRunning(true)
+      lastFrameTimeRef.current = 0
       animFrameRef.current = requestAnimationFrame(drawLoop)
     } catch (e) {
       console.error('[SpectoVoice] mic error:', e)
@@ -412,6 +423,7 @@ export default function App() {
     if (!analyserRef.current) { startRecording(); return }
     snapToLive()
     setIsRunning(true)
+    lastFrameTimeRef.current = 0
     animFrameRef.current = requestAnimationFrame(drawLoop)
   }, [drawLoop, snapToLive, startRecording])
 
@@ -422,42 +434,58 @@ export default function App() {
   }, [isRunning, pauseRecording, resumeRecording, startRecording])
 
   // ── panning (window-level so dragging outside canvas still works) ─────────
-  const handleMouseDown = useCallback((e: React.MouseEvent) => {
+  const startDrag = useCallback((clientX: number) => {
     isDraggingRef.current   = true
-    dragStartXRef.current   = e.clientX
+    dragStartXRef.current   = clientX
     dragStartPanRef.current = panOffsetRef.current
-    document.body.style.cursor = 'grabbing'
-    e.preventDefault()
   }, [])
 
-  useEffect(() => {
-    const onMove = (e: MouseEvent) => {
-      if (!isDraggingRef.current) return
-      const canvas = canvasRef.current
-      if (!canvas) return
-
-      const dx     = e.clientX - dragStartXRef.current
-      const maxPan = Math.max(0, totalPxRef.current - canvas.width)
-      panOffsetRef.current = Math.max(0, Math.min(maxPan, dragStartPanRef.current + dx))
-
-      const nowPanned = panOffsetRef.current > 0
-      if (nowPanned !== isPannedRef.current) {
-        isPannedRef.current = nowPanned
-        setIsPanned(nowPanned)
-      }
-      renderViewport()
+  const moveDrag = useCallback((clientX: number) => {
+    if (!isDraggingRef.current) return
+    const canvas = canvasRef.current
+    if (!canvas) return
+    const dx     = clientX - dragStartXRef.current
+    const maxPan = Math.max(0, totalPxRef.current - canvas.width)
+    panOffsetRef.current = Math.max(0, Math.min(maxPan, dragStartPanRef.current + dx))
+    const nowPanned = panOffsetRef.current > 0
+    if (nowPanned !== isPannedRef.current) {
+      isPannedRef.current = nowPanned
+      setIsPanned(nowPanned)
     }
-    const onUp = () => {
-      isDraggingRef.current      = false
-      document.body.style.cursor = ''
-    }
-    window.addEventListener('mousemove', onMove)
-    window.addEventListener('mouseup',   onUp)
-    return () => {
-      window.removeEventListener('mousemove', onMove)
-      window.removeEventListener('mouseup',   onUp)
-    }
+    renderViewport()
   }, [renderViewport])
+
+  const endDrag = useCallback(() => {
+    isDraggingRef.current      = false
+    document.body.style.cursor = ''
+  }, [])
+
+  const handleMouseDown = useCallback((e: React.MouseEvent) => {
+    startDrag(e.clientX)
+    document.body.style.cursor = 'grabbing'
+    e.preventDefault()
+  }, [startDrag])
+
+  const handleTouchStart = useCallback((e: React.TouchEvent) => {
+    if (e.touches.length === 1) startDrag(e.touches[0].clientX)
+  }, [startDrag])
+
+  useEffect(() => {
+    const onMouseMove = (e: MouseEvent) => moveDrag(e.clientX)
+    const onTouchMove = (e: TouchEvent) => {
+      if (e.touches.length === 1) { moveDrag(e.touches[0].clientX); e.preventDefault() }
+    }
+    window.addEventListener('mousemove', onMouseMove)
+    window.addEventListener('mouseup',   endDrag)
+    window.addEventListener('touchmove', onTouchMove, { passive: false })
+    window.addEventListener('touchend',  endDrag)
+    return () => {
+      window.removeEventListener('mousemove', onMouseMove)
+      window.removeEventListener('mouseup',   endDrag)
+      window.removeEventListener('touchmove', onTouchMove)
+      window.removeEventListener('touchend',  endDrag)
+    }
+  }, [moveDrag, endDrag])
 
   // ── cleanup ───────────────────────────────────────────────────────────────
   useEffect(() => {
@@ -481,6 +509,7 @@ export default function App() {
           ref={canvasRef}
           style={styles.canvas}
           onMouseDown={handleMouseDown}
+          onTouchStart={handleTouchStart}
         />
 
         <FreqLabels />
@@ -599,9 +628,10 @@ const styles: Record<string, React.CSSProperties> = {
     flexDirection: 'column',
     alignItems: 'center',
     width: '100vw',
-    height: '100vh',
-    padding: '20px 24px 16px',
-    gap: '16px',
+    height: '100dvh',
+    padding: '12px 16px 8px',
+    gap: '8px',
+    boxSizing: 'border-box',
   },
   title: {
     fontSize: '1.2rem',
@@ -624,6 +654,7 @@ const styles: Record<string, React.CSSProperties> = {
     position: 'relative',
     width: '100%',
     flex: 1,
+    minHeight: 0,
     borderRadius: '10px',
     overflow: 'hidden',
     border: '1px solid #222240',
@@ -712,9 +743,12 @@ const styles: Record<string, React.CSSProperties> = {
   controls: {
     display: 'flex',
     alignItems: 'center',
-    gap: '32px',
+    justifyContent: 'center',
+    flexWrap: 'wrap',
+    gap: '16px',
     flexShrink: 0,
-    paddingBottom: '8px',
+    width: '100%',
+    paddingBottom: '4px',
   },
   playBtn: {
     width: '72px',
@@ -744,7 +778,7 @@ const styles: Record<string, React.CSSProperties> = {
     letterSpacing: '0.1em',
   },
   slider: {
-    width: '180px',
+    width: 'min(180px, 38vw)',
     accentColor: '#6666cc',
     cursor: 'pointer',
   },
