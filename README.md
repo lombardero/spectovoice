@@ -2,6 +2,8 @@
 
 A real-time voice spectrogram in the browser. Records your microphone and displays a scrolling frequency waterfall (frequency vs. time).
 
+**Live demo:** https://lombardero.github.io/spectovoice/
+
 ## Requirements
 
 - [Node.js](https://nodejs.org) (v18 or later)
