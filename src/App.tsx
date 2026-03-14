@@ -5,6 +5,10 @@ import {
   MIN_FREQ_HZ, MAX_FREQ_HZ, FREQ_SCALE_EXP,
   BUFFER_SECS, DEFAULT_BRIGHTNESS,
   GAMMA, ONSET_BOOST, ONSET_SENSITIVITY, ONSET_GATE,
+  NOISE_GATE_DB,
+  COMP_THRESHOLD, COMP_KNEE, COMP_RATIO, COMP_ATTACK, COMP_RELEASE,
+  LOW_SHELF_FREQ, LOW_SHELF_GAIN,
+  HIGH_SHELF_FREQ, HIGH_SHELF_GAIN,
 } from './config'
 
 // ---------------------------------------------------------------------------
@@ -394,9 +398,50 @@ export default function App() {
       const physH = canvasRef.current?.height ?? 800
       yToFracBinRef.current = buildYToFracBin(physH, FFT_SIZE, audioCtx.sampleRate)
 
+      // ── Audio processing pipeline ───────────────────────────────────────
+      // Chain: source → noiseGate → lowShelf → compressor → highShelf → analysers
+
+      // Noise gate via WaveShaperNode: zeroes samples whose amplitude is below
+      // NOISE_GATE_DB, suppressing background hiss between vocal phrases.
+      const gateAmp = Math.pow(10, NOISE_GATE_DB / 20)
+      const gateCurveLen = 512
+      const gateCurve = new Float32Array(gateCurveLen)
+      for (let i = 0; i < gateCurveLen; i++) {
+        const x = (i * 2) / (gateCurveLen - 1) - 1 // -1 … +1
+        gateCurve[i] = Math.abs(x) < gateAmp ? 0 : x
+      }
+      const noiseGate = audioCtx.createWaveShaper()
+      noiseGate.curve = gateCurve
+      noiseGate.oversample = '2x'
+
+      // Low-shelf boost — lifts low-pitched content and vocal fry.
+      const lowShelf = audioCtx.createBiquadFilter()
+      lowShelf.type = 'lowshelf'
+      lowShelf.frequency.value = LOW_SHELF_FREQ
+      lowShelf.gain.value = LOW_SHELF_GAIN
+
+      // Dynamics compressor — evens out quiet vs. loud input.
+      const compressor = audioCtx.createDynamicsCompressor()
+      compressor.threshold.value = COMP_THRESHOLD
+      compressor.knee.value      = COMP_KNEE
+      compressor.ratio.value     = COMP_RATIO
+      compressor.attack.value    = COMP_ATTACK
+      compressor.release.value   = COMP_RELEASE
+
+      // High-shelf cut — rolls off upper-spectrum noise.
+      const highShelf = audioCtx.createBiquadFilter()
+      highShelf.type = 'highshelf'
+      highShelf.frequency.value = HIGH_SHELF_FREQ
+      highShelf.gain.value = HIGH_SHELF_GAIN
+
+      // Connect the chain.
       const source = audioCtx.createMediaStreamSource(stream)
-      source.connect(analyser)
-      source.connect(onsetAnalyser)
+      source.connect(noiseGate)
+      noiseGate.connect(lowShelf)
+      lowShelf.connect(compressor)
+      compressor.connect(highShelf)
+      highShelf.connect(analyser)
+      highShelf.connect(onsetAnalyser)
 
       snapToLive()
       setIsRunning(true)

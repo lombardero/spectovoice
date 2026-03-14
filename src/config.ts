@@ -108,3 +108,43 @@ export const ONSET_SENSITIVITY = 10
 // ── Display defaults ─────────────────────────────────────────────────────────
 
 export const DEFAULT_BRIGHTNESS = 1.0
+
+// ── Audio processing pipeline ─────────────────────────────────────────────────
+//
+// Applied before the AnalyserNode in this order:
+//   MediaStreamSource → NoiseGate (WaveShaper) → LowShelf → DynamicsCompressor
+//                     → HighShelf → AnalyserNode
+//
+// Nodes are created unconditionally; set gains to 0 / ratios to 1 to bypass.
+
+// Noise gate — signals with absolute amplitude below this dB level are zeroed.
+// This silences background hiss when there is no vocal input.
+//   -70 = very sensitive gate (only near-silence gated)
+//   -50 = good default — quiet room noise is gated, soft voice passes
+//   -35 = aggressive gate (soft vocal fry may also be cut)
+export const NOISE_GATE_DB = -50
+
+// DynamicsCompressorNode — evens out the range between quiet and loud sounds.
+// threshold: signals above this dB are compressed
+// knee:      softness of the threshold transition (dB)
+// ratio:     input dB change required to produce 1 dB of output change above threshold
+// attack:    time (s) for gain reduction to kick in after exceeding threshold
+// release:   time (s) for gain to recover after falling below threshold
+export const COMP_THRESHOLD = -24   // dB
+export const COMP_KNEE      = 10    // dB
+export const COMP_RATIO     = 4     // :1
+export const COMP_ATTACK    = 0.003 // seconds
+export const COMP_RELEASE   = 0.25  // seconds
+
+// Low-shelf BiquadFilterNode — boosts bass to improve visibility of vocal fry
+// and low-pitched sounds in the spectrogram.
+//   Frequency: shelf transition point (Hz)
+//   Gain:      boost in dB (set to 0 to disable)
+export const LOW_SHELF_FREQ = 250 // Hz
+export const LOW_SHELF_GAIN = 6   // dB (positive = boost)
+
+// High-shelf BiquadFilterNode — rolls off high frequencies to reduce noise
+// in the upper spectrum.
+//   Gain: cut in dB (set to 0 to disable, use negative values for a cut)
+export const HIGH_SHELF_FREQ = 8_000 // Hz
+export const HIGH_SHELF_GAIN = -6    // dB (negative = cut)
